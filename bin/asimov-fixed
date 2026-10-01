@@ -1,0 +1,473 @@
+#!/usr/bin/python3
+"""Reconcile generated development directories with Time Machine fixed exclusions."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+DEFAULT_CONFIG = Path("/Library/Application Support/Asimov/config.json")
+DEFAULT_STATE_DIR = Path("/var/db/asimov")
+TIME_MACHINE_DOMAIN = "/Library/Preferences/com.apple.TimeMachine"
+TMUTIL = "/usr/bin/tmutil"
+DEFAULT_MAX_AGE_SECONDS = 3600
+NOTIFICATION_REPEAT_SECONDS = 86400
+
+SENTINELS: dict[str, tuple[str, ...]] = {
+    "Cargo.toml": ("target",),
+    "package.json": ("node_modules", ".parcel-cache"),
+    "Package.swift": (".build",),
+    "Podfile": ("Pods",),
+    "bower.json": ("bower_components",),
+    "requirements.txt": (".venv", "venv"),
+    "pyproject.toml": (".venv", "venv"),
+    "tox.ini": (".tox",),
+    "noxfile.py": (".nox",),
+    "build.gradle": ("build",),
+    "build.gradle.kts": ("build",),
+    "pubspec.yaml": ("build",),
+    "setup.py": ("build",),
+    "stack.yaml": (".stack-work",),
+    "Vagrantfile": (".vagrant",),
+    "composer.json": ("vendor",),
+    "Gemfile": ("vendor",),
+    "go.mod": ("vendor",),
+    "mix.exs": ("deps", ".build"),
+    ".terraformrc": (".terraform.d",),
+    "terragrunt.hcl": (".terragrunt-cache",),
+    "cdk.json": ("cdk.out",),
+}
+
+PRUNE_NAMES = {
+    ".git",
+    ".cache",
+    ".dart_tool",
+    ".gradle",
+    ".next",
+    ".nox",
+    ".opencode",
+    ".parcel-cache",
+    ".pnpm-store",
+    ".stack-work",
+    ".terraform.d",
+    ".terragrunt-cache",
+    ".tox",
+    ".turbo",
+    ".vagrant",
+    ".venv",
+    ".yarn",
+    "Pods",
+    "bower_components",
+    "build",
+    "cdk.out",
+    "coverage",
+    "deps",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+}
+
+
+class AsimovError(RuntimeError):
+    """Expected operational failure."""
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def expand_path(value: str, home: Path) -> Path:
+    if value == "~":
+        return home
+    if value.startswith("~/"):
+        return home / value[2:]
+    return Path(value)
+
+
+def canonical(path: Path) -> Path:
+    return Path(os.path.realpath(path))
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    try:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise AsimovError(f"cannot read configuration {path}: {error}") from error
+    for key in ("home", "roots"):
+        if key not in config:
+            raise AsimovError(f"configuration is missing {key!r}")
+    if not isinstance(config["roots"], list) or not config["roots"]:
+        raise AsimovError("configuration roots must be a non-empty list")
+    return config
+
+
+def discover(config: dict[str, Any]) -> tuple[list[Path], list[str]]:
+    home = Path(config["home"])
+    candidates: set[Path] = set()
+    errors: list[str] = []
+    ignored = {
+        canonical(expand_path(value, home)) for value in config.get("ignore_paths", [])
+    }
+
+    for value in config.get("explicit_paths", []):
+        path = expand_path(value, home)
+        if path.is_dir():
+            candidates.add(canonical(path))
+
+    for value in config["roots"]:
+        root = expand_path(value, home)
+        if not root.is_dir():
+            errors.append(f"scan root is missing or unreadable: {root}")
+            continue
+        try:
+            def record_walk_error(error: OSError) -> None:
+                errors.append(f"scan failed under {root}: {error}")
+
+            for current, directories, files in os.walk(
+                root, topdown=True, onerror=record_walk_error
+            ):
+                current_path = Path(current)
+                canonical_current = canonical(current_path)
+                if any(canonical_current == path or path in canonical_current.parents for path in ignored):
+                    directories[:] = []
+                    continue
+                retained: list[str] = []
+                for directory in directories:
+                    child = current_path / directory
+                    canonical_child = canonical(child)
+                    if any(canonical_child == path or path in canonical_child.parents for path in ignored):
+                        continue
+                    if config.get("exclude_worktree_roots", True) and directory.endswith("__worktrees"):
+                        candidates.add(canonical(child))
+                        continue
+                    if directory in PRUNE_NAMES:
+                        continue
+                    retained.append(directory)
+                directories[:] = retained
+
+                file_names = set(files)
+                for sentinel, outputs in SENTINELS.items():
+                    if sentinel not in file_names:
+                        continue
+                    for output in outputs:
+                        candidate = current_path / output
+                        if candidate.is_dir():
+                            candidates.add(canonical(candidate))
+        except OSError as error:
+            errors.append(f"scan failed under {root}: {error}")
+
+    return collapse_paths(candidates), errors
+
+
+def collapse_paths(paths: Iterable[Path]) -> list[Path]:
+    ordered = sorted(set(paths), key=lambda path: (len(path.parts), str(path)))
+    result: list[Path] = []
+    for path in ordered:
+        if any(path == parent or parent in path.parents for parent in result):
+            continue
+        result.append(path)
+    return sorted(result, key=str)
+
+
+def run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(command, check=check, capture_output=True)
+
+
+def read_fixed_exclusions() -> set[Path]:
+    result = run(["/usr/bin/defaults", "export", TIME_MACHINE_DOMAIN, "-"])
+    try:
+        data = plistlib.loads(result.stdout)
+    except plistlib.InvalidFileException as error:
+        raise AsimovError("Time Machine preferences are not a valid plist") from error
+    values = data.get("SkipPaths", [])
+    if not isinstance(values, list):
+        raise AsimovError("Time Machine SkipPaths is not an array")
+    return {canonical(Path(value)) for value in values if isinstance(value, str)}
+
+
+def read_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json_atomic(path: Path, value: Any, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def validate_managed_path(path: Path, config: dict[str, Any]) -> None:
+    home = canonical(Path(config["home"]))
+    roots = [canonical(expand_path(value, home)) for value in config["roots"]]
+    resolved_output_roots = [
+        canonical(expand_path(value, home))
+        for value in config.get("resolved_output_roots", [])
+    ]
+    explicit = [canonical(expand_path(value, home)) for value in config.get("explicit_paths", [])]
+    if path in explicit:
+        return
+    allowed_roots = roots + resolved_output_roots
+    if not any(path == root or root in path.parents for root in allowed_roots):
+        raise AsimovError(f"refusing path outside configured roots: {path}")
+    if any(path == root or root in path.parents for root in resolved_output_roots):
+        return
+    if path.name.endswith("__worktrees"):
+        return
+    if path.name not in {name for outputs in SENTINELS.values() for name in outputs}:
+        raise AsimovError(f"refusing unrecognized generated directory: {path}")
+
+
+def newest_manifest(config: dict[str, Any]) -> Optional[Path]:
+    destination = Path(config.get("backup_destination", "/Volumes/KINGSTON"))
+    manifests = list(destination.glob("*.inprogress/.exclusions.plist"))
+    manifests += list(destination.glob("*.previous/.exclusions.plist"))
+    manifests += list(destination.glob("*.backup/.exclusions.plist"))
+    return max(manifests, key=lambda path: path.stat().st_mtime, default=None)
+
+
+def verify_manifest(config: dict[str, Any], managed: set[Path], applied_epoch: float) -> dict[str, Any]:
+    manifest = newest_manifest(config)
+    if manifest is None:
+        return {"state": "pending", "reason": "no backup exclusion manifest is available"}
+    manifest_mtime = manifest.stat().st_mtime
+    if manifest_mtime < applied_epoch:
+        return {
+            "state": "pending",
+            "reason": "latest backup started before the most recent reconciliation",
+            "manifest": str(manifest),
+        }
+    try:
+        data = plistlib.loads(manifest.read_bytes())
+    except (OSError, plistlib.InvalidFileException) as error:
+        return {"state": "failed", "reason": f"cannot read {manifest}: {error}"}
+    configured = {canonical(Path(value)) for value in data.get("userExclusionPaths", [])}
+    missing = sorted(str(path) for path in managed - configured)
+    if missing:
+        return {
+            "state": "failed",
+            "reason": "backup manifest is missing managed fixed exclusions",
+            "manifest": str(manifest),
+            "missing": missing,
+        }
+    return {"state": "verified", "manifest": str(manifest), "verified_at": utc_now()}
+
+
+def publish_failure(state_dir: Path, message: str) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "failed").write_text(f"{utc_now()} {message}\n")
+    os.chmod(state_dir / "failed", 0o644)
+
+
+def clear_failure(state_dir: Path) -> None:
+    try:
+        (state_dir / "failed").unlink()
+    except FileNotFoundError:
+        pass
+
+
+def reconcile(config_path: Path, state_dir: Path) -> int:
+    if os.geteuid() != 0:
+        raise AsimovError("fixed-path reconciliation must run as root")
+    config = load_config(config_path)
+    started_at = utc_now()
+    discovered, scan_errors = discover(config)
+    if scan_errors:
+        raise AsimovError("; ".join(scan_errors))
+    for path in discovered:
+        validate_managed_path(path, config)
+
+    previous_state = read_json(
+        state_dir / "managed.json", {"paths": [], "last_changed_epoch": 0}
+    )
+    previously_managed = {canonical(Path(value)) for value in previous_state.get("paths", [])}
+    managed = previously_managed | set(discovered)
+    current = read_fixed_exclusions()
+    missing = sorted(managed - current, key=str)
+    if missing:
+        command = [TMUTIL, "addexclusion", "-p", *(str(path) for path in missing)]
+        result = run(command, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).decode(errors="replace").strip()
+            raise AsimovError(f"tmutil failed with exit {result.returncode}: {detail}")
+
+    last_changed_epoch = (
+        dt.datetime.now().timestamp()
+        if missing
+        else float(previous_state.get("last_changed_epoch", 0))
+    )
+    current_after = read_fixed_exclusions()
+    still_missing = sorted(str(path) for path in managed - current_after)
+    if still_missing:
+        raise AsimovError(f"fixed exclusions remain missing: {', '.join(still_missing)}")
+
+    write_json_atomic(
+        state_dir / "managed.json",
+        {
+            "updated_at": utc_now(),
+            "last_changed_epoch": last_changed_epoch,
+            "paths": sorted(str(path) for path in managed),
+        },
+        mode=0o644,
+    )
+    verification = verify_manifest(config, managed, last_changed_epoch)
+    status = {
+        "started_at": started_at,
+        "completed_at": utc_now(),
+        "state": "healthy" if verification["state"] != "failed" else "failed",
+        "discovered_count": len(discovered),
+        "managed_count": len(managed),
+        "added_count": len(missing),
+        "verification": verification,
+    }
+    write_json_atomic(state_dir / "status.json", status, mode=0o644)
+    if status["state"] == "failed":
+        publish_failure(state_dir, verification["reason"])
+        return 1
+    clear_failure(state_dir)
+    return 0
+
+
+def notification_state_path() -> Path:
+    return Path.home() / "Library/Caches/asimov/notification.json"
+
+
+def should_notify(message: str) -> bool:
+    path = notification_state_path()
+    state = read_json(path, {})
+    now = dt.datetime.now().timestamp()
+    if (
+        state.get("message") == message
+        and now - float(state.get("notified_epoch", 0)) < NOTIFICATION_REPEAT_SECONDS
+    ):
+        return False
+    write_json_atomic(
+        path,
+        {"message": message, "notified_at": utc_now(), "notified_epoch": now},
+        mode=0o600,
+    )
+    return True
+
+
+def clear_notification_state() -> None:
+    try:
+        notification_state_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def doctor(config_path: Path, state_dir: Path, notify: bool) -> int:
+    status = read_json(state_dir / "status.json", None)
+    failure = state_dir / "failed"
+    problems: list[str] = []
+    if status is None:
+        problems.append("no reconciliation status exists")
+    else:
+        try:
+            completed = dt.datetime.fromisoformat(status["completed_at"])
+            age = (dt.datetime.now(dt.timezone.utc) - completed).total_seconds()
+            if age > DEFAULT_MAX_AGE_SECONDS:
+                problems.append(f"last reconciliation is stale ({int(age)} seconds old)")
+        except (KeyError, TypeError, ValueError):
+            problems.append("reconciliation status has an invalid completion time")
+        if status.get("state") != "healthy":
+            problems.append("last reconciliation failed")
+    if failure.exists():
+        problems.append(failure.read_text().strip())
+
+    if problems:
+        message = "; ".join(problems)
+        print(f"asimov: unhealthy: {message}", file=sys.stderr)
+        if notify and should_notify(message):
+            notifier = shutil.which("terminal-notifier")
+            if notifier:
+                subprocess.run(
+                    [notifier, "-title", "Asimov needs attention", "-message", message, "-group", "com.raine.asimov"],
+                    check=False,
+                )
+            else:
+                script = f'display notification {json.dumps(message)} with title "Asimov needs attention"'
+                subprocess.run(["/usr/bin/osascript", "-e", script], check=False)
+        return 1
+    clear_notification_state()
+    print(json.dumps(status, indent=2, sort_keys=True))
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("reconcile")
+    subparsers.add_parser("discover")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--notify", action="store_true")
+    subparsers.add_parser("verify")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "reconcile":
+            args.state_dir.mkdir(parents=True, exist_ok=True)
+            with (args.state_dir / "reconcile.lock").open("w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise AsimovError("another reconciliation is already running") from error
+                return reconcile(args.config, args.state_dir)
+        config = load_config(args.config)
+        if args.command == "discover":
+            paths, errors = discover(config)
+            for path in paths:
+                print(path)
+            for error in errors:
+                print(f"asimov: {error}", file=sys.stderr)
+            return 1 if errors else 0
+        if args.command == "doctor":
+            return doctor(args.config, args.state_dir, args.notify)
+        if args.command == "verify":
+            state = read_json(args.state_dir / "managed.json", {"paths": []})
+            managed = {canonical(Path(value)) for value in state.get("paths", [])}
+            result = verify_manifest(config, managed, 0)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 1 if result["state"] == "failed" else 0
+    except (AsimovError, OSError, subprocess.SubprocessError) as error:
+        message = str(error)
+        print(f"asimov: {message}", file=sys.stderr)
+        if args.command == "reconcile":
+            publish_failure(args.state_dir, message)
+            write_json_atomic(
+                args.state_dir / "status.json",
+                {"completed_at": utc_now(), "state": "failed", "reason": message},
+                mode=0o644,
+            )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,19 @@
+{
+  "home": "/Users/raine",
+  "roots": [
+    "~/code",
+    "~/work/epicgames"
+  ],
+  "explicit_paths": [
+    "~/node_modules",
+    "~/mdwatch/target"
+  ],
+  "ignore_paths": [
+    "~/code/asimov/tests"
+  ],
+  "resolved_output_roots": [
+    "~/Library/Caches/mbx/targets"
+  ],
+  "exclude_worktree_roots": true,
+  "backup_destination": "/Volumes/KINGSTON"
+}

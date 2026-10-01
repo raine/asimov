@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.raine.asimov.health</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/asimov-fixed</string>
+        <string>doctor</string>
+        <string>--notify</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>900</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/raine/Library/Logs/asimov-health.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/raine/Library/Logs/asimov-health.err.log</string>
+</dict>
+</plist>

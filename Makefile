@@ -31,15 +31,18 @@ BASH_BIN ?=
 # Run tests concurrently (requires GNU parallel: brew install parallel).
 BATS_JOBS ?=
 
-test: ## Run Bats tests (BASH_BIN=/bin/bash pins the interpreter; BATS_JOBS=N runs in parallel)
+test: ## Run Bats and fixed-service tests (BASH_BIN=/bin/bash pins the interpreter; BATS_JOBS=N runs in parallel)
 	@BASH_BIN="$(BASH_BIN)" BATS_JOBS="$(BATS_JOBS)" scripts/test.sh
+	@/usr/bin/python3 -m unittest discover -s tests -p 'test_fixed.py'
 
 test-system-bash: ## Run Bats tests under the macOS system bash (3.2), as shipped users get
 	@$(MAKE) --no-print-directory test BASH_BIN=/bin/bash
 
-lint: ## Run Shellcheck on all shell scripts
+lint: ## Run Shellcheck and syntax checks
 	@shellcheck -x --source-path=. bin/asimov
-	@shellcheck scripts/install.sh scripts/install-remote.sh scripts/uninstall.sh scripts/prep-release.sh scripts/test.sh tests/test_helper.bash tests/bin/run-tests.sh tests/bin/tmutil tests/bin/mdfind tests/bin/launchctl
+	@shellcheck scripts/install.sh scripts/install-fixed scripts/install-remote.sh scripts/uninstall.sh scripts/prep-release.sh scripts/test.sh tests/test_helper.bash tests/bin/run-tests.sh tests/bin/tmutil tests/bin/mdfind tests/bin/launchctl
+	@/usr/bin/python3 -m py_compile bin/asimov-fixed tests/test_fixed.py
+	@plutil -lint launchd/*.plist >/dev/null
 
 check: test lint ## Run tests and linting
 

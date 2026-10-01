@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly repo_dir
+readonly daemon_label='com.raine.asimov.fixed'
+readonly health_label='com.raine.asimov.health'
+readonly old_label='com.raine.asimov'
+uid="$(id -u)"
+readonly uid
+readonly install_dir='/usr/local/libexec'
+readonly config_dir='/Library/Application Support/Asimov'
+launcher_build="$(mktemp -d)/asimov-launcher"
+readonly launcher_build
+trap 'rm -rf "$(dirname "$launcher_build")"' EXIT
+readonly daemon_plist="/Library/LaunchDaemons/${daemon_label}.plist"
+readonly health_plist="${HOME}/Library/LaunchAgents/${health_label}.plist"
+readonly old_plist="${HOME}/Library/LaunchAgents/${old_label}.plist"
+
+printf 'Building the dedicated Asimov launcher…\n'
+/usr/bin/xcrun swiftc -O "$repo_dir/Sources/AsimovLauncher/main.swift" -o "$launcher_build"
+/usr/bin/codesign --force --sign - "$launcher_build"
+
+printf 'Installing the root-owned Asimov fixed-path reconciler…\n'
+sudo /usr/bin/install -d -o root -g wheel -m 755 "$install_dir" "$config_dir"
+sudo /usr/bin/install -o root -g wheel -m 755 \
+    "$repo_dir/bin/asimov-fixed" "$install_dir/asimov-fixed"
+sudo /usr/bin/install -o root -g wheel -m 755 \
+    "$launcher_build" "$install_dir/asimov-launcher"
+sudo /usr/bin/install -o root -g wheel -m 644 \
+    "$repo_dir/config/raine.json" "$config_dir/config.json"
+sudo /usr/bin/install -o root -g wheel -m 644 \
+    "$repo_dir/launchd/${daemon_label}.plist" "$daemon_plist"
+sudo /usr/bin/touch /Library/Logs/asimov-fixed.log /Library/Logs/asimov-fixed.err.log
+sudo /usr/sbin/chown root:wheel /Library/Logs/asimov-fixed.log /Library/Logs/asimov-fixed.err.log
+
+/usr/bin/install -d -m 755 "${HOME}/Library/LaunchAgents" "${HOME}/Library/Logs"
+/usr/bin/install -m 644 "$repo_dir/launchd/${health_label}.plist" "$health_plist"
+
+# The former agent writes sticky xattrs, which are not a reliable source of
+# backup rules when Spotlight's exclusion index is unavailable.
+/bin/launchctl bootout "gui/${uid}/${old_label}" 2>/dev/null || true
+if [[ -f "$old_plist" ]]; then
+    /bin/mv "$old_plist" "${old_plist}.disabled"
+fi
+
+sudo /bin/launchctl bootout "system/${daemon_label}" 2>/dev/null || true
+/bin/launchctl bootout "gui/${uid}/${health_label}" 2>/dev/null || true
+
+sudo /bin/launchctl bootstrap system "$daemon_plist"
+sudo /bin/launchctl kickstart -k "system/${daemon_label}"
+/bin/launchctl bootstrap "gui/${uid}" "$health_plist"
+/bin/launchctl kickstart -k "gui/${uid}/${health_label}"
+
+printf '\nInstalled. Grant Full Disk Access to:\n  %s/asimov-launcher\n' "$install_dir"
+printf 'Then run: sudo launchctl kickstart -k system/%s\n' "$daemon_label"
+printf 'Check health with: %s doctor\n' "$install_dir/asimov-fixed"

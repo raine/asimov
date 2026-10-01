@@ -2,6 +2,10 @@
 
 **Stop backing up files you'll never restore.**
 
+> This branch includes Raine's fixed-path Time Machine service. See
+> [docs/fixed-path-service.md](docs/fixed-path-service.md) for its policy,
+> installation, verification, and failure reporting.
+
 [![Tests](https://github.com/AsimovMac/asimov/actions/workflows/tests.yml/badge.svg)](https://github.com/AsimovMac/asimov/actions/workflows/tests.yml)
 [![Latest release](https://img.shields.io/github/v/release/AsimovMac/asimov?include_prereleases&sort=semver&color=blue)](https://github.com/AsimovMac/asimov/releases)
 [![Stars](https://img.shields.io/github/stars/AsimovMac/asimov?style=flat)](https://github.com/AsimovMac/asimov/stargazers)
